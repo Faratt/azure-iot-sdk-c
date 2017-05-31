@@ -20,6 +20,10 @@ typedef struct MESSAGE_QUEUE_TAG MESSAGE_QUEUE;
 #define RESULT_OK 0
 #define INDEFINITE_TIME ((time_t)(-1))
 
+const char* SAVED_OPTION_MAX_ENQUEUE_TIME_SECS = "SAVED_OPTION_MAX_ENQUEUE_TIME_SECS";
+const char* SAVED_OPTION_MAX_PROCESSING_TIME_SECS = "SAVED_OPTION_MAX_PROCESSING_TIME_SECS";
+
+
 struct MESSAGE_QUEUE_TAG
 {
 	double max_message_enqueued_time_secs;
@@ -40,7 +44,6 @@ typedef struct MESSAGE_QUEUE_ITEM_TAG
 	MESSAGE_HANDLE message;
 	time_t enqueue_time;
 	time_t processing_start_time;
-	MESSAGE_QUEUE_HANDLE message_queue;
 } MESSAGE_QUEUE_ITEM;
 
 
@@ -135,7 +138,6 @@ int message_queue_add(MESSAGE_QUEUE_HANDLE message_queue, MESSAGE_HANDLE message
 		}
 		else
 		{
-			mq_item->message_queue = message_queue;
 			mq_item->message = message;
 			mq_item->processing_start_time = INDEFINITE_TIME;
 			result = RESULT_OK;
@@ -163,30 +165,40 @@ int message_queue_is_empty(MESSAGE_QUEUE_HANDLE message_queue, bool* is_empty)
 	return result;
 }
 
-static bool find_list_item_by_ptr_addr(LIST_ITEM_HANDLE list_item, const void* match_context)
+static bool dequeue_message_and_fire_callback(MESSAGE_QUEUE_HANDLE message_queue, SINGLYLINKEDLIST_HANDLE list, MESSAGE_HANDLE message, MESSAGE_QUEUE_RESULT result, void* reason)
 {
-	const void* list_item_value = singlylinkedlist_item_get_value(list_item);
+	LIST_ITEM_HANDLE list_item = singlylinkedlist_get_head_item(list);
 
-	return (list_item_value == match_context);
+	while (list_item != NULL)
+	{
+		MESSAGE_QUEUE_ITEM* mq_item = singlylinkedlist_item_get_value(list_item);
+
+		if (mq_item->message == message)
+		{
+			(void)singlylinkedlist_remove(list, list_item);
+
+			if (message_queue->on_message_processing_completed_callback != NULL)
+			{
+				message_queue->on_message_processing_completed_callback(mq_item->message, result, reason, message_queue->on_message_processing_completed_context);
+			}
+
+			free(mq_item);
+
+			break;
+		}
+	}
+
+	return (list_item != NULL);
 }
+
 
 static void on_message_processing_completed_callback(MESSAGE_HANDLE message, MESSAGE_QUEUE_RESULT result, void* reason, void* context)
 {
-	MESSAGE_QUEUE_ITEM* mq_item = (MESSAGE_QUEUE_ITEM*)context;
+	MESSAGE_QUEUE_HANDLE message_queue = (MESSAGE_QUEUE_HANDLE)context;
 
-	LIST_ITEM_HANDLE list_item = singlylinkedlist_find(mq_item->message_queue->in_progress, find_list_item_by_ptr_addr, mq_item);
-
-	if (list_item != NULL)
+	if (!dequeue_message_and_fire_callback(message_queue, message_queue->in_progress, message, result, reason))
 	{
-		(void)singlylinkedlist_remove(mq_item->message_queue->in_progress, list_item);
-
-		if (mq_item->message_queue->on_message_processing_completed_callback != NULL)
-		{
-			mq_item->message_queue->on_message_processing_completed_callback(
-				mq_item->message, result, reason, mq_item->message_queue->on_message_processing_completed_context);
-		}
-		
-		free(mq_item);
+		LogError("on_message_processing_completed_callback invoked for message not in in-progress list (%p)", message);
 	}
 }
 
@@ -217,7 +229,12 @@ static void process_timeouts(MESSAGE_QUEUE_HANDLE message_queue)
 				}
 				else if (get_difftime(current_time, mq_item->enqueue_time) >= message_queue->max_message_enqueued_time_secs)
 				{
-					on_message_processing_completed_callback(mq_item->message, MESSAGE_QUEUE_TIMEOUT, NULL, (void*)message_queue);
+					(void)dequeue_message_and_fire_callback(message_queue, message_queue->pending, mq_item->message, MESSAGE_QUEUE_TIMEOUT, NULL);
+				}
+				else
+				{
+					// The pending list order is already based on enqueue time, so if one message is not expired, later ones won't be either.
+					break;
 				}
 			}
 
@@ -236,7 +253,7 @@ static void process_timeouts(MESSAGE_QUEUE_HANDLE message_queue)
 				}
 				else if (get_difftime(current_time, mq_item->enqueue_time) >= message_queue->max_message_enqueued_time_secs)
 				{
-					on_message_processing_completed_callback(mq_item->message, MESSAGE_QUEUE_TIMEOUT, NULL, (void*)message_queue);
+					(void)dequeue_message_and_fire_callback(message_queue, message_queue->in_progress, mq_item->message, MESSAGE_QUEUE_TIMEOUT, NULL);
 				}
 			}
 		}
@@ -258,7 +275,12 @@ static void process_timeouts(MESSAGE_QUEUE_HANDLE message_queue)
 				}
 				else if (get_difftime(current_time, mq_item->processing_start_time) >= message_queue->max_message_processing_time_secs)
 				{
-					on_message_processing_completed_callback(mq_item->message, MESSAGE_QUEUE_TIMEOUT, NULL, (void*)message_queue);
+					(void)dequeue_message_and_fire_callback(message_queue, message_queue->in_progress, mq_item->message, MESSAGE_QUEUE_TIMEOUT, NULL);
+				}
+				else
+				{
+					// The in-progress list order is already based on start-processing time, so if one message is not expired, later ones won't be either.
+					break;
 				}
 			}
 		}
@@ -275,18 +297,18 @@ static void process_pending_messages(MESSAGE_QUEUE_HANDLE message_queue)
 
 		if (singlylinkedlist_remove(message_queue->pending, list_item) != 0)
 		{
-			LogError("failed moving message %p out of pending list", mq_item->message);
+			LogError("failed moving message out of pending list (%p)", mq_item->message);
 			on_message_processing_completed_callback(mq_item->message, MESSAGE_QUEUE_ERROR, NULL, (void*)mq_item);
 			break; // Trying to avoid an infinite loop
 		}
 		else if ((mq_item->processing_start_time = get_time(NULL)) == INDEFINITE_TIME)
 		{
-			LogError("failed setting message %p processing_start_time", mq_item->message);
+			LogError("failed setting message processing_start_time (%p)", mq_item->message);
 			on_message_processing_completed_callback(mq_item->message, MESSAGE_QUEUE_ERROR, NULL, (void*)mq_item);
 		}
 		else if (singlylinkedlist_add(message_queue->in_progress, (const void*)mq_item) != 0)
 		{
-			LogError("failed moving message %p to in-progress list", mq_item->message);
+			LogError("failed moving message to in-progress list (%p)", mq_item->message);
 			on_message_processing_completed_callback(mq_item->message, MESSAGE_QUEUE_ERROR, NULL, (void*)mq_item);
 		}
 		else
@@ -313,16 +335,83 @@ void message_queue_remove_all(MESSAGE_QUEUE_HANDLE message_queue)
 
 		while ((list_item = singlylinkedlist_get_head_item(message_queue->in_progress)) != NULL)
 		{
-			MESSAGE_QUEUE_ITEM* mq_item = singlylinkedlist_item_get_value(list_item);
+			MESSAGE_QUEUE_ITEM* mq_item = (MESSAGE_QUEUE_ITEM*)singlylinkedlist_item_get_value(list_item);
 
-			(void)singlylinkedlist_remove(message_queue->in_progress, list_item);
+			(void)dequeue_message_and_fire_callback(message_queue, message_queue->in_progress, mq_item->message, MESSAGE_QUEUE_CANCELLED, NULL);
+		}
 
-			//on_message_processing_completed_callback()
+		while ((list_item = singlylinkedlist_get_head_item(message_queue->pending)) != NULL)
+		{
+			MESSAGE_QUEUE_ITEM* mq_item = (MESSAGE_QUEUE_ITEM*)singlylinkedlist_item_get_value(list_item);
+
+			(void)dequeue_message_and_fire_callback(message_queue, message_queue->pending, mq_item->message, MESSAGE_QUEUE_CANCELLED, NULL);
 		}
 	}
 }
 
-OPTIONHANDLER_HANDLE retrieve_options(MESSAGE_QUEUE_HANDLE handle)
+static void* cloneOption(const char* name, const void* value) 
+{
+	void* result;
+
+	if (name == NULL || value == NULL)
+	{
+		LogError("invalid argument (name=%p, value=%p)", name, value);
+		result = NULL;
+	}
+	else if (strcmp(SAVED_OPTION_MAX_ENQUEUE_TIME_SECS, name) == 0 || strcmp(SAVED_OPTION_MAX_PROCESSING_TIME_SECS, name) == 0)
+	{
+		if ((result = malloc(sizeof(double))) == NULL)
+		{
+			LogError("failed cloning option %s (malloc failed)", name);
+		}
+		else
+		{
+			memcpy(result, value, sizeof(double));
+		}
+	}
+	else
+	{
+		LogError("option %s is invalid", name);
+		result = NULL;
+	}
+
+	return result;
+}
+
+static void destroyOption(const char* name, const void* value)
+{
+}
+
+static int setOption(void* handle, const char* name, const void* value)
 {
 
+}
+
+OPTIONHANDLER_HANDLE retrieve_options(MESSAGE_QUEUE_HANDLE message_queue)
+{
+	OPTIONHANDLER_HANDLE result;
+
+	if (message_queue == NULL)
+	{
+		LogError("invalid argument (message_queue is NULL)");
+		result = NULL;
+	}
+	else if ((result = OptionHandler_Create(cloneOption, destroyOption, setOption)) == NULL)
+	{
+		LogError("failed creating OPTIONHANDLER_HANDLE");
+	}
+	else if (OptionHandler_AddOption(result, SAVED_OPTION_MAX_ENQUEUE_TIME_SECS, &message_queue->max_message_enqueued_time_secs) != OPTIONHANDLER_OK)
+	{
+		LogError("failed retrieving options (failed adding %s)", SAVED_OPTION_MAX_ENQUEUE_TIME_SECS);
+		OptionHandler_Destroy(result);
+		result = NULL;
+	}
+	else if (OptionHandler_AddOption(result, SAVED_OPTION_MAX_PROCESSING_TIME_SECS, &message_queue->max_message_processing_time_secs) != OPTIONHANDLER_OK)
+	{
+		LogError("failed retrieving options (failed adding %s)", SAVED_OPTION_MAX_PROCESSING_TIME_SECS);
+		OptionHandler_Destroy(result);
+		result = NULL;
+	}
+
+	return result;
 }

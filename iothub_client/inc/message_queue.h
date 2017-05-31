@@ -44,7 +44,7 @@ extern void message_queue_remove_all(MESSAGE_QUEUE_HANDLE message_queue);
 extern int message_queue_is_empty(MESSAGE_QUEUE_HANDLE message_queue, bool* is_empty);
 extern void message_queue_do_work(MESSAGE_QUEUE_HANDLE message_queue);
 
-extern OPTIONHANDLER_HANDLE retrieve_options(MESSAGE_QUEUE_HANDLE handle);
+extern OPTIONHANDLER_HANDLE retrieve_options(MESSAGE_QUEUE_HANDLE message_queue);
 
 #ifdef __cplusplus
 }
